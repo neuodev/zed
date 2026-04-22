@@ -35,6 +35,7 @@ use std::{
         Arc,
         atomic::{self, AtomicBool},
     },
+    time::Duration,
 };
 use ui::{
     ButtonLike, CommonAnimationExt, ContextMenu, HighlightedLabel, Indicator, KeyBinding, ListItem,
@@ -413,6 +414,7 @@ pub struct FileFinderDelegate {
     focus_handle: FocusHandle,
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
+    pending_scan_refresh: Task<()>,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -858,8 +860,11 @@ impl FileFinderDelegate {
             focus_handle: cx.focus_handle(),
             include_ignored: FileFinderSettings::get_global(cx).include_ignored,
             include_ignored_refresh: Task::ready(()),
+            pending_scan_refresh: Task::ready(()),
         }
     }
+
+    const SCAN_REFRESH_DEBOUNCE: Duration = Duration::from_millis(128);
 
     fn subscribe_to_updates(
         project: &Entity<Project>,
@@ -870,9 +875,21 @@ impl FileFinderDelegate {
             match event {
                 project::Event::WorktreeUpdatedEntries(_, _)
                 | project::Event::WorktreeAdded(_)
-                | project::Event::WorktreeRemoved(_) => file_finder
-                    .picker
-                    .update(cx, |picker, cx| picker.refresh(window, cx)),
+                | project::Event::WorktreeRemoved(_) => {
+                    file_finder.picker.update(cx, |picker, cx| {
+                        picker.delegate.pending_scan_refresh =
+                            cx.spawn_in(window, async move |picker, cx| {
+                                cx.background_executor()
+                                    .timer(Self::SCAN_REFRESH_DEBOUNCE)
+                                    .await;
+                                picker
+                                    .update_in(cx, |picker, window, cx| {
+                                        picker.refresh(window, cx);
+                                    })
+                                    .log_err();
+                            });
+                    })
+                }
                 _ => {}
             };
         })
@@ -1081,14 +1098,12 @@ impl FileFinderDelegate {
                 }
             }
 
-            self.selected_index = selected_match.map_or_else(
-                || self.calculate_selected_index(cx),
-                |m| {
-                    self.matches
-                        .position(&m, self.currently_opened_path.as_ref())
-                        .unwrap_or(0)
-                },
-            );
+            let fallback_selected_index = self.calculate_selected_index(cx);
+            self.selected_index = selected_match.map_or(fallback_selected_index, |m| {
+                self.matches
+                    .position(&m, self.currently_opened_path.as_ref())
+                    .unwrap_or(fallback_selected_index)
+            });
 
             self.latest_search_query = Some(query);
             self.latest_search_did_cancel = did_cancel;
